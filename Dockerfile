@@ -15,4 +15,4 @@ COPY . /app
 
 # Cloud Run слушает порт из $PORT, по умолчанию 8080
 ENV PORT=8080
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "main:fastapi_app", "--host", "0.0.0.0", "--port", "8080"]
