@@ -1,234 +1,128 @@
+# main.py
+# Telegram webhook + FastAPI на Cloud Run
+# Требует переменные окружения:
+#   TELEGRAM_BOT_TOKEN  – токен бота
+#   WEBHOOK_SECRET      – секрет, который ты добавляешь в путь вебхука
+#   ALLOWED_CHATS       – список chat_id через запятую (можно оставить пустым)
+# Cloud Run передаёт переменную PORT (по умолчанию 8080) – мы её слушаем.
+
 import os
-import re
-import json
-import tempfile
 import logging
-from typing import Optional, List
+from typing import List
 
-import requests
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ---------- ЛОГИ ----------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("reels-transcriber")
-
-# ---------- ENV ----------
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_API_KEY     = os.environ.get("OPENAI_API_KEY", "").strip()
-WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "").strip()
-ALLOWED_CHATS      = os.environ.get("ALLOWED_CHATS", "").strip()
-
-if not TELEGRAM_BOT_TOKEN:
-    log.error("ENV TELEGRAM_BOT_TOKEN is not set")
-if not OPENAI_API_KEY:
-    log.error("ENV OPENAI_API_KEY is not set")
-if not WEBHOOK_SECRET:
-    log.warning("ENV WEBHOOK_SECRET is not set (webhook will not be protected)")
-
-ALLOWED_CHAT_IDS: Optional[List[int]] = None
-if ALLOWED_CHATS:
-    try:
-        ALLOWED_CHAT_IDS = [int(x) for x in re.split(r"[,\s]+", ALLOWED_CHATS) if x]
-    except Exception:
-        log.warning("Could not parse ALLOWED_CHATS=%s", ALLOWED_CHATS)
-
-# ---------- OPENAI ----------
-try:
-    from openai import OpenAI
-    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception as e:
-    openai_client = None
-    log.error("Failed to init OpenAI client: %s", e)
-
-# ---------- FASTAPI ----------
-app = FastAPI()
-
-# ---------- HELPERS ----------
-
-TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-URL_REGEX = re.compile(
-    r"(https?://[^\s]+)",
-    flags=re.IGNORECASE
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
 )
 
-def split_by_chunks(text: str, limit: int = 3900) -> List[str]:
-    """Режем ответ на части, чтобы не превышать лимит Телеграма (4096)."""
-    res, cur = [], []
-    cur_len = 0
-    for line in text.splitlines(True):
-        if cur_len + len(line) > limit:
-            res.append("".join(cur))
-            cur = [line]
-            cur_len = len(line)
-        else:
-            cur.append(line)
-            cur_len += len(line)
-    if cur:
-        res.append("".join(cur))
-    return res or ["(пусто)"]
+# ---------- Конфигурация ----------
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+ALLOWED_CHATS_RAW = os.getenv("ALLOWED_CHATS", "").strip()
 
-def tg_send_message(chat_id: int, text: str, reply_to: Optional[int] = None):
-    data = {"chat_id": chat_id, "text": text}
-    if reply_to:
-        data["reply_to_message_id"] = reply_to
-        data["allow_sending_without_reply"] = True
-    r = requests.post(f"{TG_API}/sendMessage", json=data, timeout=30)
-    if r.status_code != 200:
-        log.error("sendMessage error: %s", r.text)
+if not BOT_TOKEN:
+    # Без токена бот не запустится, поэтому явно падаем понятной ошибкой в логах
+    raise RuntimeError("Env TELEGRAM_BOT_TOKEN is not set")
 
-def extract_first_url(text: str) -> Optional[str]:
-    m = URL_REGEX.search(text or "")
-    return m.group(1) if m else None
+# Разбираем список разрешённых чатов
+def parse_allowed(raw: str) -> List[int]:
+    out: List[int] = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        try:
+            out.append(int(p))
+        except ValueError:
+            logging.warning("Skip bad chat id: %r", p)
+    return out
 
-def is_instagram_url(url: str) -> bool:
-    return "instagram.com/reel" in url or "instagram.com/p/" in url or "instagram.com/tv/" in url
+ALLOWED_CHATS = parse_allowed(ALLOWED_CHATS_RAW)
 
-def download_audio_with_ytdlp(url: str) -> Optional[str]:
-    """
-    Качаем аудио дорожку через yt-dlp.
-    Возвращаем путь к временной .mp3/.m4a, либо None.
-    """
-    try:
-        import yt_dlp
-    except Exception as e:
-        log.error("yt-dlp not installed: %s", e)
-        return None
+# Логирование по‑умолчанию
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger("insta-transcriber-bot")
 
-    tmpdir = tempfile.mkdtemp(prefix="reels_")
-    out_tmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
+# ---------- FastAPI + PTB ----------
+app = FastAPI(title="Insta Transcriber Bot")
 
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": out_tmpl,
-        "quiet": True,
-        "noprogress": True,
-        "nocheckcertificate": True,
-        # если видео публичное, этого достаточно.
-        # для приватных потребуются cookies — это отдельная тема.
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
-    }
+# PTB Application создаём один раз и переиспользуем
+tg_app: Application = Application.builder().token(BOT_TOKEN).build()
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            # yt-dlp после pp даёт путь к .mp3 в info["requested_downloads"][0]["filepath"]
-            # но на разных версиях по‑разному, поэтому ищем файл в tmpdir
-            for root, _, files in os.walk(tmpdir):
-                for fn in files:
-                    if fn.lower().endswith((".mp3", ".m4a", ".wav")):
-                        return os.path.join(root, fn)
-    except Exception as e:
-        log.error("yt-dlp download error: %s", e)
-        return None
-    return None
+# --- Утилиты ---
 
-def transcribe_file(path: str) -> str:
-    if not openai_client:
-        return "Ошибка: OpenAI клиент не инициализирован."
-    try:
-        with open(path, "rb") as f:
-            tr = openai_client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="text",
-                temperature=0
-            )
-        # client v1 отдаёт .text при response_format="text"
-        return tr if isinstance(tr, str) else getattr(tr, "text", str(tr))
-    except Exception as e:
-        log.error("OpenAI transcription error: %s", e)
-        return f"Ошибка транскрибации: {e}"
+def is_allowed(chat_id: int) -> bool:
+    # Если ALLOWED_CHATS пуст – разрешаем всем
+    return (not ALLOWED_CHATS) or (chat_id in ALLOWED_CHATS)
 
-def check_allowed(chat_id: Optional[int]) -> bool:
-    if not ALLOWED_CHAT_IDS:
-        return True
-    try:
-        return int(chat_id) in ALLOWED_CHAT_IDS
-    except Exception:
-        return False
+# --- Хендлеры Telegram ---
 
-# ---------- ROUTES ----------
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    if not is_allowed(chat_id):
+        await context.bot.send_message(chat_id=chat_id, text="⛔️ Доступ ограничён.")
+        return
+
+    text = (
+        "Привет! Я бот для транскрибации Reels/коротких видео.\n\n"
+        "Отправь ссылку на Instagram Reels — я скачаю звук и сделаю текст.\n"
+        "Пока для теста я просто отвечаю, что вебхук работает ✅"
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text)
+
+async def text_echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    if not is_allowed(chat_id):
+        return
+    msg = (update.message.text or "").strip()
+    # Здесь позже вставим обработку ссылки/скачивание/транскрибацию.
+    await context.bot.send_message(chat_id=chat_id, text=f"Принял сообщение: {msg}\n(вебхук работает)")
+
+# Регистрируем хендлеры
+tg_app.add_handler(CommandHandler("start", start_handler))
+tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_echo_handler))
+
+# ---------- Роуты FastAPI ----------
 
 @app.get("/", response_class=PlainTextResponse)
-def root():
-    return "OK"
+async def root():
+    # Простой healthcheck для Cloud Run
+    return "ok"
 
-@app.post("/webhook", response_class=JSONResponse)
-async def webhook(request: Request):
-    # Проверяем секрет от Telegram (опционально, но желательно)
-    if WEBHOOK_SECRET:
-        header_secret = request.headers.get("x-telegram-bot-api-secret-token")
-        if header_secret != WEBHOOK_SECRET:
-            raise HTTPException(status_code=403, detail="Bad secret")
+@app.get("/health", response_class=PlainTextResponse)
+async def health():
+    return "ok"
 
-    update = await request.json()
-    log.info("Update: %s", json.dumps(update)[:2000])
+@app.post(f"/webhook/{{secret}}")
+async def webhook(secret: str, request: Request):
+    # Проверяем секрет в URL
+    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Bad webhook secret")
 
-    msg = None
-    chat_id = None
-    msg_id = None
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # update.message.text / update.channel_post / edited_message — обрабатываем базовый случай
-    if "message" in update:
-        msg = update["message"]
-    elif "channel_post" in update:
-        msg = update["channel_post"]
+    try:
+        update = Update.de_json(data, tg_app.bot)
+        # Обрабатываем апдейт через PTB
+        await tg_app.process_update(update)
+    except Exception as e:
+        logger.exception("Failed to process update: %s", e)
+        return JSONResponse({"ok": False})
 
-    if msg:
-        chat_id = msg.get("chat", {}).get("id")
-        msg_id = msg.get("message_id")
-        text = msg.get("text") or msg.get("caption") or ""
+    return JSONResponse({"ok": True})
 
-        if not check_allowed(chat_id):
-            tg_send_message(chat_id, "⛔️ Доступ к боту ограничен.", msg_id)
-            return {"ok": True}
-
-        # стартовая команда
-        if text.startswith("/start"):
-            tg_send_message(
-                chat_id,
-                "Привет! Отправь ссылку на Instagram Reels (публичную), я сделаю транскрипт.",
-                msg_id
-            )
-            return {"ok": True}
-
-        url = extract_first_url(text)
-        if not url:
-            tg_send_message(chat_id, "Пришлите ссылку на видео (Instagram Reels).", msg_id)
-            return {"ok": True}
-
-        if not is_instagram_url(url):
-            tg_send_message(chat_id, "Похоже, это не ссылка на Instagram. Нужна ссылка вида instagram.com/reel/…", msg_id)
-            return {"ok": True}
-
-        tg_send_message(chat_id, "⏳ Скачиваю аудио…", msg_id)
-        audio_path = download_audio_with_ytdlp(url)
-        if not audio_path:
-            tg_send_message(chat_id, "Не удалось скачать аудио. Убедитесь, что ролик публичный.", msg_id)
-            return {"ok": True}
-
-        tg_send_message(chat_id, "🎙 Транскрибирую…", msg_id)
-        text = transcribe_file(audio_path)
-
-        for chunk in split_by_chunks("📝 Расшифровка:\n\n" + text):
-            tg_send_message(chat_id, chunk)
-
-        return {"ok": True}
-
-    # игнорируем несообщения (callback_query и т.п.)
-    return {"ok": True}
-
-
-# Локальный запуск (в Cloud Run не используется, но не мешает)
+# Локальный запуск (для отладки). В Cloud Run можно оставить – не мешает.
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.getenv("PORT", "8080"))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
