@@ -1,128 +1,100 @@
 # main.py
-# Telegram webhook + FastAPI на Cloud Run
-# Требует переменные окружения:
-#   TELEGRAM_BOT_TOKEN  – токен бота
-#   WEBHOOK_SECRET      – секрет, который ты добавляешь в путь вебхука
-#   ALLOWED_CHATS       – список chat_id через запятую (можно оставить пустым)
-# Cloud Run передаёт переменную PORT (по умолчанию 8080) – мы её слушаем.
-
 import os
-import logging
+import asyncio
 from typing import List
 
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from pydantic import BaseModel
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
-# ---------- Конфигурация ----------
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
-ALLOWED_CHATS_RAW = os.getenv("ALLOWED_CHATS", "").strip()
+# ==== Конфигурация из переменных окружения ====
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+WEBHOOK_SECRET     = os.getenv("WEBHOOK_SECRET", "").strip()
+ALLOWED_CHATS_RAW  = os.getenv("ALLOWED_CHATS", "").strip()
 
-if not BOT_TOKEN:
-    # Без токена бот не запустится, поэтому явно падаем понятной ошибкой в логах
-    raise RuntimeError("Env TELEGRAM_BOT_TOKEN is not set")
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN не задан как переменная окружения")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("WEBHOOK_SECRET не задан как переменная окружения")
 
-# Разбираем список разрешённых чатов
-def parse_allowed(raw: str) -> List[int]:
-    out: List[int] = []
-    for part in raw.split(","):
-        p = part.strip()
-        if not p:
-            continue
-        try:
-            out.append(int(p))
-        except ValueError:
-            logging.warning("Skip bad chat id: %r", p)
-    return out
+ALLOWED_CHATS: List[int] = []
+if ALLOWED_CHATS_RAW:
+    try:
+        ALLOWED_CHATS = [int(x) for x in ALLOWED_CHATS_RAW.split(",") if x.strip()]
+    except Exception:
+        # Если формат неверный — игнорируем (лучше поправить в Cloud Run)
+        ALLOWED_CHATS = []
 
-ALLOWED_CHATS = parse_allowed(ALLOWED_CHATS_RAW)
-
-# Логирование по‑умолчанию
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("insta-transcriber-bot")
-
-# ---------- FastAPI + PTB ----------
+# ==== FastAPI ====
 app = FastAPI(title="Insta Transcriber Bot")
 
-# PTB Application создаём один раз и переиспользуем
-tg_app: Application = Application.builder().token(BOT_TOKEN).build()
+@app.get("/")
+async def root():
+    # Наличие корня с 200 OK помогает Cloud Run health-check
+    return {"ok": True, "service": "insta-transcriber-bot"}
 
-# --- Утилиты ---
+@app.get("/healthz")
+async def healthz():
+    return {"status": "ok"}
 
-def is_allowed(chat_id: int) -> bool:
-    # Если ALLOWED_CHATS пуст – разрешаем всем
-    return (not ALLOWED_CHATS) or (chat_id in ALLOWED_CHATS)
+# ==== Telegram Application ====
+application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-# --- Хендлеры Telegram ---
+def _allowed(chat_id: int) -> bool:
+    return True if not ALLOWED_CHATS else (chat_id in ALLOWED_CHATS)
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id if update.effective_chat else 0
-    if not is_allowed(chat_id):
-        await context.bot.send_message(chat_id=chat_id, text="⛔️ Доступ ограничён.")
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not _allowed(update.effective_chat.id):
         return
-
-    text = (
-        "Привет! Я бот для транскрибации Reels/коротких видео.\n\n"
-        "Отправь ссылку на Instagram Reels — я скачаю звук и сделаю текст.\n"
-        "Пока для теста я просто отвечаю, что вебхук работает ✅"
+    await update.message.reply_text(
+        "Привет! Отправь ссылку на Instagram Reels — верну расшифровку.\n"
+        "Пока что проверяем, что бот жив 😉"
     )
-    await context.bot.send_message(chat_id=chat_id, text=text)
 
-async def text_echo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = update.effective_chat.id if update.effective_chat else 0
-    if not is_allowed(chat_id):
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not _allowed(update.effective_chat.id):
         return
-    msg = (update.message.text or "").strip()
-    # Здесь позже вставим обработку ссылки/скачивание/транскрибацию.
-    await context.bot.send_message(chat_id=chat_id, text=f"Принял сообщение: {msg}\n(вебхук работает)")
+    await update.message.reply_text("Команды: /start, /help")
+
+# Заглушка на любые сообщения (позже сюда добавим транс-крипт)
+async def any_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or not _allowed(update.effective_chat.id):
+        return
+    text = (update.message.text or "").strip()
+    if "instagram.com/reel" in text or "instagram.com/p/" in text:
+        await update.message.reply_text("Принял ссылку. Логика транскрибации будет добавлена после проверки запуска 👍")
+    else:
+        await update.message.reply_text("Пришли ссылку на Reels, пожалуйста.")
 
 # Регистрируем хендлеры
-tg_app.add_handler(CommandHandler("start", start_handler))
-tg_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_echo_handler))
+application.add_handler(CommandHandler("start", start_cmd))
+application.add_handler(CommandHandler("help", help_cmd))
+application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), any_text))
 
-# ---------- Роуты FastAPI ----------
+# ==== Жизненный цикл в связке с FastAPI ====
+@app.on_event("startup")
+async def on_startup():
+    # Важно: initialize/start, чтобы application был готов обрабатывать update
+    await application.initialize()
+    await application.start()
 
-@app.get("/", response_class=PlainTextResponse)
-async def root():
-    # Простой healthcheck для Cloud Run
-    return "ok"
+@app.on_event("shutdown")
+async def on_shutdown():
+    await application.stop()
+    await application.shutdown()
 
-@app.get("/health", response_class=PlainTextResponse)
-async def health():
-    return "ok"
+# ==== Модель для вебхука (принимаем «как есть») ====
+class TelegramUpdate(BaseModel):
+    root: dict
 
-@app.post(f"/webhook/{{secret}}")
-async def webhook(secret: str, request: Request):
-    # Проверяем секрет в URL
-    if WEBHOOK_SECRET and secret != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Bad webhook secret")
-
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    try:
-        update = Update.de_json(data, tg_app.bot)
-        # Обрабатываем апдейт через PTB
-        await tg_app.process_update(update)
-    except Exception as e:
-        logger.exception("Failed to process update: %s", e)
-        return JSONResponse({"ok": False})
-
-    return JSONResponse({"ok": True})
-
-# Локальный запуск (для отладки). В Cloud Run можно оставить – не мешает.
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8080"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
+@app.post("/webhook/{secret}")
+async def telegram_webhook(secret: str, request: Request):
+    if secret != WEBHOOK_SECRET:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    data = await request.json()
+    update = Update.de_json(data, application.bot)
+    # Передаём событие в PTB
+    await application.process_update(update)
+    return {"ok": True}
