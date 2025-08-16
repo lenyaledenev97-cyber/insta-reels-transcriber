@@ -1,19 +1,18 @@
-# Dockerfile
 FROM python:3.11-slim
 
-# Ставим системные зависимости (по минимуму)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl ca-certificates \
+# ffmpeg нужен yt-dlp для извлечения аудио
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# зависимости
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-COPY . .
+# код
+COPY . /app
 
-ENV PYTHONUNBUFFERED=1
-
-# ВАЖНО: слушаем именно $PORT (Cloud Run прокинет его, обычно 8080)
-CMD ["bash", "-lc", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+# Cloud Run слушает порт из $PORT, по умолчанию 8080
+ENV PORT=8080
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
