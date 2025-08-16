@@ -10,12 +10,12 @@ from pydantic import BaseModel
 
 from telegram import Update
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, ContextTypes,
-    filters
+    Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
 
 from yt_dlp import YoutubeDL
 from openai import OpenAI
+
 
 # ---------- Конфигурация через переменные окружения ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -38,13 +38,15 @@ if ALLOWED_CHATS_RAW:
         # Если формат неверный — оставим пустым, чтобы не блокировать запуск
         ALLOWED_CHATS = []
 
-# OpenAI клиент
+
+# ---------- OpenAI ----------
 oai = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # ---------- Telegram ----------
 app_tg = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-# Простой регекс для ссылок на Instagram Reels
+# Регекс для ссылок на Instagram Reels
 RE_REELS = re.compile(
     r"(https?://(?:www\.)?instagram\.com/(?:reel|reels)/[^\s/?#]+(?:\?[^\s]*)?)",
     re.IGNORECASE
@@ -71,7 +73,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
-
     m = RE_REELS.search(text)
     if not m:
         await update.message.reply_text("Пришли ссылку на Reels, пожалуйста.")
@@ -107,21 +108,18 @@ async def download_and_transcribe(url: str) -> str:
     Скачиваем только аудио (без ffmpeg), отдаём в OpenAI gpt-4o-mini-transcribe.
     OpenAI принимает аудио-форматы mp4/m4a/webm/mp3/wav и т.п.
     """
-    # yt-dlp блокирующий — выносим в отдельный поток
     def _download_audio(tmpdir: str) -> str:
-        # Скачиваем bestaudio, сохраняем в tmpdir. Выходной путь получим из результата.
         ydl_opts = {
             "format": "bestaudio/best",
             "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
             "quiet": True,
             "noprogress": True,
             "nocheckcertificate": True,
-            # Иногда IG просит куки, но для публичных роликов обычного хватает
         }
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
-            return filename  # путь к загруженному файлу (чаще .m4a или .mp4)
+            return filename  # путь к загруженному файлу
 
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -133,27 +131,31 @@ async def download_and_transcribe(url: str) -> str:
                 model="gpt-4o-mini-transcribe",
                 file=f,
             )
-        # У разных версий SDK ответ может быть в resp.text или resp["text"]
+
+        # У разных версий SDK ответ может быть в resp.text или другом поле
         text = getattr(resp, "text", None) or getattr(resp, "text_output", None)
         if not text and isinstance(resp, dict):
             text = resp.get("text")
         return text or ""
 
+
 # Регистрируем хендлеры
 app_tg.add_handler(CommandHandler("start", cmd_start))
 app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text))
+
 
 # ---------- FastAPI (webhook) ----------
 class TelegramUpdate(BaseModel):
     update_id: int | None = None
 
+# ВАЖНО: имя приложения должно быть именно "app" (Cloud Run ждёт main:app)
 app = FastAPI()
 
-@fastapi_app.get("/")
+@app.get("/")
 async def health():
     return {"ok": True}
 
-@fastapi_app.post(f"/webhook/{{secret}}")
+@app.post(f"/webhook/{{secret}}")
 async def webhook(secret: str, request: Request):
     if secret != WEBHOOK_SECRET:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -162,7 +164,8 @@ async def webhook(secret: str, request: Request):
     await app_tg.process_update(update)
     return {"ok": True}
 
+
 # Локальный запуск (не используется в Cloud Run)
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(fastapi_app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
