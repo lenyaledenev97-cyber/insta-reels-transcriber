@@ -147,7 +147,7 @@ app_tg.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text
 class TelegramUpdate(BaseModel):
     update_id: int | None = None
 
-fastapi_app = FastAPI()
+app = FastAPI()
 
 @fastapi_app.get("/")
 async def health():
