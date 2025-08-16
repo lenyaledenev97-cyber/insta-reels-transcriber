@@ -1,20 +1,19 @@
-# Используем Python
-FROM python:3.10-slim
+# Dockerfile
+FROM python:3.11-slim
 
-# Устанавливаем рабочую директорию
+# Ставим системные зависимости (по минимуму)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Копируем зависимости
 COPY requirements.txt .
-
-# Устанавливаем зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь проект
 COPY . .
 
-# Указываем порт (Cloud Run сам подставит $PORT)
-ENV PORT=8080
+ENV PYTHONUNBUFFERED=1
 
-# Запуск приложения
-CMD ["gunicorn", "-b", ":8080", "main:app"]
+# ВАЖНО: слушаем именно $PORT (Cloud Run прокинет его, обычно 8080)
+CMD ["bash", "-lc", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080}"]
